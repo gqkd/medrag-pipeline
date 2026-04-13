@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  medrag-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data   # Persist the FAISS index across restarts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Optional: run the ETL pipeline on startup
+  medrag-pipeline:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: >
+      python scripts/run_pipeline.py
+        --query "diabetes treatment metformin GLP-1"
+        --max_results 30
+        --drugs metformin semaglutide
+    profiles:
+      - pipeline   # Only runs with: docker-compose --profile pipeline up
