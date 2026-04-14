@@ -1,34 +1,44 @@
 """
 src/agent/agent.py
 ───────────────────
-MedRAG ReAct agent.
+MedRAG ReAct agent — LangGraph implementation.
 
-Wraps a LangChain AgentExecutor built on the ReAct pattern:
-  Thought → Action → Observation → … → Final Answer
+Uses langgraph.prebuilt.create_react_agent which drives tool-calling via the
+LLM's native function-calling API instead of text parsing. This is more
+reliable, supports streaming out of the box, and integrates cleanly with
+LangSmith tracing.
 
-The agent autonomously decides which of its four tools to invoke (and with
-what arguments) based solely on the question and the tool descriptions.
-Each response includes extracted source citations for traceability.
+The public interface (AgentResponse, MedRAGAgent, build_agent) is unchanged
+from the previous implementation — only the internal wiring changed.
 
-Build the agent via the module-level factory::
+Usage::
 
     from src.agent.agent import build_agent
     agent = build_agent()
     response = agent.query("What are the cardiovascular effects of metformin?")
     print(response)
+
+    # Streaming
+    for chunk in agent.stream_query("What are the side effects of semaglutide?"):
+        if isinstance(chunk, str):
+            print(chunk, end="", flush=True)
+        else:
+            print("\\nSources:", chunk.sources)
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from langchain_classic.agents import create_react_agent, AgentExecutor
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 
 from src.agent.tools import build_tools
-from src.agent.prompts import build_react_prompt
+from src.agent.prompts import SYSTEM_PROMPT
 from src.pipeline.vector_store import MedRAGVectorStore
 from src.ingestion.openfda_client import OpenFDAClient
 
@@ -50,7 +60,7 @@ class AgentResponse:
         sources:             Deduplicated source citation strings.
         tools_used:          Names of every tool invoked (may contain duplicates).
         processing_time_s:   Wall-clock seconds for the full agent run.
-        intermediate_steps:  Raw LangChain step list (action, observation) pairs.
+        intermediate_steps:  Raw LangGraph messages list for debugging.
     """
 
     answer: str
@@ -78,17 +88,17 @@ class AgentResponse:
 
 class MedRAGAgent:
     """
-    A LangChain ReAct agent specialised for biomedical question answering.
+    LangGraph-based ReAct agent for biomedical question answering.
 
-    The agent uses GPT-4.1-mini by default (good balance of cost and quality
-    for RAG tasks). Switch to ``gpt-4.1`` for more complex multi-hop questions.
+    Uses GPT-4.1-mini by default. Tool calling is driven by the LLM's native
+    function-calling API — more reliable than text-parsed ReAct.
 
     Parameters:
         vector_store:     A loaded :class:`MedRAGVectorStore` instance.
         model:            OpenAI model name.
         temperature:      LLM temperature (keep low for factual tasks).
-        max_iterations:   Maximum ReAct reasoning loops before giving up.
-        verbose:          Print agent's reasoning trace to stdout.
+        max_iterations:   Maximum agent loop iterations before stopping.
+        verbose:          Log intermediate messages at DEBUG level.
     """
 
     def __init__(
@@ -103,126 +113,191 @@ class MedRAGAgent:
 
         self.vector_store = vector_store
         self._fda_client = OpenFDAClient()
+        self._verbose = verbose
 
         _model = model or settings.default_model
         _temp = temperature if temperature is not None else settings.llm_temperature
-        _max_iter = max_iterations or settings.max_agent_iterations
+        self._max_iter = max_iterations or settings.max_agent_iterations
 
-        log.info("Initialising MedRAGAgent | model=%s | max_iter=%d", _model, _max_iter)
+        # LangGraph recursion_limit: each agent→tools round is 2 steps + 1 final
+        self._recursion_limit = 2 * self._max_iter + 1
+
+        log.info("Initialising MedRAGAgent | model=%s | max_iter=%d", _model, self._max_iter)
 
         llm = ChatOpenAI(model=_model, temperature=_temp)
         tools = build_tools(vector_store, self._fda_client)
-        prompt = build_react_prompt()
 
-        react_agent = create_react_agent(llm, tools, prompt)
-
-        self._executor = AgentExecutor(
-            agent=react_agent,
-            tools=tools,
-            verbose=verbose,
-            max_iterations=_max_iter,
-            handle_parsing_errors=(
-                "I encountered a formatting error. Let me try again with a cleaner response."
-            ),
-            return_intermediate_steps=True,
-            early_stopping_method="generate",
-        )
-
+        self._graph = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
         self._tool_names = [t.name for t in tools]
         log.info("Agent ready | tools=%s", self._tool_names)
 
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     # Public interface
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
 
     def query(self, question: str) -> AgentResponse:
         """
         Answer a biomedical question using RAG + tool calling.
-
-        The agent will:
-        1. Decide which tools to invoke based on the question
-        2. Execute the tools iteratively (ReAct loop)
-        3. Synthesise a cited, evidence-based final answer
 
         Args:
             question: Any biomedical question in natural language.
 
         Returns:
             :class:`AgentResponse` with answer text, citations, and metadata.
-
-        Raises:
-            RuntimeError: If the vector store has not been loaded.
         """
-        import time
-
         log.info("Query: %r", question[:100])
         t0 = time.perf_counter()
 
-        result = self._executor.invoke({
-            "input": question,
-            "chat_history": "",
-        })
+        result = self._graph.invoke(
+            {"messages": [HumanMessage(content=question)]},
+            config={"recursion_limit": self._recursion_limit},
+        )
 
         elapsed = time.perf_counter() - t0
-        steps = result.get("intermediate_steps", [])
-        sources, tools_used = self._extract_citations(steps)
+        messages = result.get("messages", [])
+
+        if self._verbose:
+            for msg in messages:
+                log.debug("  [%s] %s", type(msg).__name__, str(msg.content)[:200])
+
+        answer = self._extract_answer(messages)
+        sources, tools_used = self._extract_citations(messages)
 
         return AgentResponse(
-            answer=result.get("output", "No answer generated."),
+            answer=answer,
             sources=sources,
             tools_used=tools_used,
             processing_time_s=round(elapsed, 2),
-            intermediate_steps=steps,
+            intermediate_steps=messages,
         )
 
     def stream_query(self, question: str):
         """
-        Generator that yields token strings as the agent produces them.
-        Useful for streaming UIs (Streamlit, FastAPI StreamingResponse).
+        Generator that streams the agent response progressively.
 
-        Note: intermediate tool calls are not yielded — only the final
-        answer tokens are streamed.
+        Yields:
+            - ``("status", str)`` tuples each time the agent invokes a tool,
+              so the UI can show what the agent is doing in real time.
+            - ``("answer", str)`` tuple once the final answer is ready.
+            - An :class:`AgentResponse` as the very last item, carrying
+              sources, tool names, and timing metadata.
+
+        Example (Streamlit)::
+
+            status_ph = st.empty()
+            answer_ph = st.empty()
+            response = None
+            for item in agent.stream_query(question):
+                if isinstance(item, AgentResponse):
+                    response = item
+                    status_ph.empty()
+                elif item[0] == "status":
+                    status_ph.markdown(item[1])
+                elif item[0] == "answer":
+                    answer_ph.markdown(item[1])
         """
-        for event in self._executor.stream({"input": question, "chat_history": ""}):
-            if isinstance(event, dict):
-                output = event.get("output", "")
-                if output:
-                    yield output
+        _TOOL_ICONS = {
+            "search_pubmed_literature":   "🔍",
+            "lookup_fda_drug_info":        "💊",
+            "search_drug_in_literature":   "📚",
+            "get_adverse_event_statistics": "📊",
+        }
 
-    # ─────────────────────────────────────────────────────────────
-    # Source extraction
-    # ─────────────────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        all_messages: list = []
+        status_lines: list[str] = []
+
+        for chunk in self._graph.stream(
+            {"messages": [HumanMessage(content=question)]},
+            config={"recursion_limit": self._recursion_limit},
+            stream_mode="updates",
+        ):
+            for node_output in chunk.values():
+                for msg in node_output.get("messages", []):
+                    all_messages.append(msg)
+
+                    if isinstance(msg, AIMessage):
+                        # Tool invocations — yield one status line per call
+                        if getattr(msg, "tool_calls", None) and not msg.content:
+                            for tc in msg.tool_calls:
+                                name = (
+                                    tc.get("name") if isinstance(tc, dict)
+                                    else getattr(tc, "name", "")
+                                )
+                                args = (
+                                    tc.get("args", {}) if isinstance(tc, dict)
+                                    else getattr(tc, "args", {})
+                                )
+                                q_str = (
+                                    args.get("query")
+                                    or args.get("drug_name")
+                                    or ""
+                                ).strip()
+                                icon = _TOOL_ICONS.get(name, "⚙️")
+                                label = (
+                                    f"{icon} **{name}**"
+                                    + (f': *"{q_str[:55]}"*' if q_str else "")
+                                )
+                                status_lines.append(label)
+                                yield ("status", "\n".join(
+                                    f"- {l}" for l in status_lines
+                                ))
+
+                        # Final answer text
+                        elif msg.content:
+                            yield ("answer", str(msg.content))
+
+        elapsed = time.perf_counter() - t0
+        answer = self._extract_answer(all_messages)
+        sources, tools_used = self._extract_citations(all_messages)
+
+        yield AgentResponse(
+            answer=answer,
+            sources=sources,
+            tools_used=tools_used,
+            processing_time_s=round(elapsed, 2),
+            intermediate_steps=all_messages,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Internals
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _extract_answer(self, messages: list) -> str:
+        """Return the content of the last AIMessage that has text."""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                return str(msg.content)
+        return "No answer generated."
 
     def _extract_citations(
-        self, steps: list
+        self, messages: list
     ) -> tuple[list[str], list[str]]:
         """
-        Parse LangChain intermediate steps to extract:
-          - citation strings (PMID lines, FDA source lines)
-          - list of tool names that were called
+        Parse LangGraph messages to extract:
+          - citation strings (PMID lines, FDA source lines) from ToolMessages
+          - list of tool names called (from AIMessage.tool_calls)
         """
         sources: list[str] = []
         tools_used: list[str] = []
-
         _citation_markers = ("PMID:", "FDA Drug Label", "NDA ", "Source: FDA", "FAERS")
 
-        for action, observation in steps:
-            # Tool name
-            if hasattr(action, "tool"):
-                tools_used.append(action.tool)
+        for msg in messages:
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+                    if name:
+                        tools_used.append(name)
 
-            # Extract citation lines from tool output
-            if not isinstance(observation, str):
-                continue
-            for line in observation.splitlines():
-                stripped = line.strip()
-                if any(marker in stripped for marker in _citation_markers):
-                    # Clean up list prefix like "[1]" or "  •"
-                    clean = stripped.lstrip("[]0123456789. •→").strip()
-                    if clean and clean not in sources:
-                        sources.append(clean)
+            elif isinstance(msg, ToolMessage) and isinstance(msg.content, str):
+                for line in msg.content.splitlines():
+                    stripped = line.strip()
+                    if any(marker in stripped for marker in _citation_markers):
+                        clean = stripped.lstrip("[]0123456789. •→").strip()
+                        if clean and clean not in sources:
+                            sources.append(clean)
 
-        return sources[:10], tools_used  # Cap citations at 10
+        return sources[:10], tools_used
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,23 +315,26 @@ def build_agent(
 
     This is the main entry point for all consumers (API, CLI, Streamlit).
 
-    Args:
-        index_path: Override the default FAISS index path.
-        model:      Override the default LLM model name.
-        verbose:    Enable agent reasoning trace output.
-
     Raises:
+        RuntimeError: If ``OPENAI_API_KEY`` is not set in the environment.
         RuntimeError: If the FAISS index does not exist yet.
-                      Solution: run ``python scripts/run_pipeline.py --query …``
     """
     from src.config import settings
+
+    if not settings.openai_api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set.\n"
+            "Add it to your .env file:\n"
+            "  OPENAI_API_KEY=sk-...\n\n"
+            "Get a key at https://platform.openai.com/api-keys"
+        )
 
     path = Path(index_path) if index_path else settings.vector_store_path
     vs = MedRAGVectorStore(index_path=path)
 
     if not vs.load():
         raise RuntimeError(
-            "FAISS index not found at: {path}\n\n"
+            f"FAISS index not found at: {path}\n\n"
             "Run the ETL pipeline first:\n"
             "  python scripts/run_pipeline.py \\\n"
             "    --query 'your medical topic' \\\n"

@@ -1,21 +1,18 @@
 """
 src/agent/prompts.py
 ─────────────────────
-System prompt and ReAct prompt template for the MedRAG agent.
+System prompt for the MedRAG LangGraph agent.
 
-Quality note: the tool descriptions in tools.py and the system prompt here
-are the single biggest levers for improving agent answer quality. Even a
-small change to how tools are described will change which tool the LLM
-picks for a given question. Iterate on these carefully.
+The LangGraph create_react_agent uses tool-calling (function calling) natively,
+so it no longer needs a manually-formatted ReAct template. Only a system prompt
+is required — it shapes the agent's behaviour, language, and citation style.
+
+Quality note: this prompt is the single biggest lever for answer quality.
+Even small edits change which tool the LLM picks and how it cites sources.
+Test any change with a representative set of queries before committing.
 """
 
 from __future__ import annotations
-
-from langchain_core.prompts import PromptTemplate
-
-# ─────────────────────────────────────────────────────────────────────────────
-# System prompt
-# ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are MedRAG, an expert biomedical research assistant.
 You have access to a curated index of PubMed literature and live FDA drug data.
@@ -41,42 +38,3 @@ Disclaimer: This tool is for research purposes only.
 Always recommend consulting a qualified healthcare professional for clinical decisions.
 
 Respond in the same language the question was asked in."""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ReAct prompt builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-_REACT_TEMPLATE = (
-    SYSTEM_PROMPT
-    + """
-
-You have access to the following tools:
-{tools}
-
-Use EXACTLY this format for every response:
-
-Question: the input question you must answer
-Thought: analyze what information you need; decide which tool to call and why
-Action: the action to take — must be one of [{tool_names}]
-Action Input: the input to the action (be specific and precise)
-Observation: the result of the action
-... (repeat Thought / Action / Action Input / Observation as many times as needed)
-Thought: I now have sufficient evidence to write a comprehensive, cited answer
-Final Answer: the final answer with all relevant sources cited inline
-
-Important:
-- Action and Action Input must ALWAYS appear together
-- Never skip to Final Answer without using at least one tool
-- If a tool returns no results, try a different query or different tool
-
-Begin!
-
-Question: {input}
-Thought:{agent_scratchpad}"""
-)
-
-
-def build_react_prompt() -> PromptTemplate:
-    """Return the ReAct :class:`PromptTemplate` for ``create_react_agent``."""
-    return PromptTemplate.from_template(_REACT_TEMPLATE)

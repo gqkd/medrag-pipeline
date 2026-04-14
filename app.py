@@ -550,9 +550,12 @@ if run_query:
         # Clear pre-filled example
         st.session_state["current_question"] = ""
 
-        # Thinking banner
-        thinking = st.empty()
-        thinking.markdown(
+        # Streaming: show tool status live, then the answer
+        status_ph = st.empty()
+        answer_ph = st.empty()
+        response = None
+
+        status_ph.markdown(
             '<div class="thinking-banner">'
             '<span class="dot dot-yellow"></span>'
             'Agent reasoning — searching literature and FDA data…'
@@ -560,16 +563,35 @@ if run_query:
             unsafe_allow_html=True,
         )
 
-        t0 = time.perf_counter()
+        from src.agent.agent import AgentResponse
         try:
-            response = agent.query(q)
-            elapsed = time.perf_counter() - t0
+            for item in agent.stream_query(q):
+                if isinstance(item, AgentResponse):
+                    response = item
+                    status_ph.empty()
+                elif item[0] == "status":
+                    status_ph.markdown(
+                        '<div class="thinking-banner">'
+                        '<span class="dot dot-yellow"></span>'
+                        f'{item[1]}'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif item[0] == "answer":
+                    answer_ph.markdown(item[1] + " ▌")
         except Exception as exc:
-            thinking.empty()
+            status_ph.empty()
+            answer_ph.empty()
             st.error(f"Agent error: {exc}")
             st.stop()
 
-        thinking.empty()
+        answer_ph.empty()
+
+        if response is None:
+            st.error("No response received from the agent.")
+            st.stop()
+
+        elapsed = response.processing_time_s
 
         # Persist to history
         st.session_state.history.append({
