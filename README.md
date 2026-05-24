@@ -337,7 +337,7 @@ MIT — see [LICENSE](LICENSE)
 
 ## 👤 Author
 
-**Giulio Quaglia** — Cloud Data Engineer | AI & LLM Systems
+**Giulio Quaglia** — AI & Data Architect
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-giulio--quaglia-0A66C2?style=flat&logo=linkedin)](https://linkedin.com/in/giulio-quaglia)
 [![GitHub](https://img.shields.io/badge/GitHub-gqkd-181717?style=flat&logo=github)](https://github.com/gqkd)
